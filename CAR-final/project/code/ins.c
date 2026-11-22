@@ -1,0 +1,200 @@
+#include "code1.h"
+
+float pos_x_final = 0.0f;       // 最终融合X坐标
+float pos_y_final = 0.0f;       // 最终融合Y坐标
+//静态变量
+float imu_acc[3]      = {0.0f};      // IMU加速度数据
+float last_vel[3]     = {0.0f};      // 上一时刻速度值
+float fused_vel[3]    = {0.0f};      // 卡尔曼滤波融合后速度
+float pos_x_encoder = 0.0f;          // 编码器解算X坐标
+float pos_y_encoder = 0.0f;          // 编码器解算Y坐标
+  
+//卡尔曼滤波结构体声明
+KF_3Axis_Velocity_t kf_nav;          // 卡尔曼滤波结构体
+
+//-------------------------------------------------------------------
+// 单轴卡尔曼滤波初始化
+//-------------------------------------------------------------------
+static void init_single_axis(KF_Axis_t *axis, float dt, float Q00, float Q01, float Q11, float R)
+{
+    axis->x[0] = 0.0f;
+    axis->x[1] = 0.0f;
+
+    axis->P[0][0] = 1.0f; axis->P[0][1] = 0.0f;
+    axis->P[1][0] = 0.0f; axis->P[1][1] = 0.01f;
+
+    axis->Q[0][0] = Q00; axis->Q[0][1] = Q01;
+    axis->Q[1][0] = Q01; axis->Q[1][1] = Q11;
+
+    axis->R = R;
+    axis->dt = dt;
+}
+
+//-------------------------------------------------------------------
+// 三轴卡尔曼滤波初始化
+//-------------------------------------------------------------------
+
+void KF_3Axis_Init(KF_3Axis_Velocity_t *kf, float dt)
+{
+    float Q00_xy = dt * dt * 0.5f;
+    float Q01_xy = 0.0f;
+    float Q11_xy = 0.3f;
+    float R_val_xy = 0.2f;
+
+    float Q00_z = dt * dt * 0.05f;
+    float Q01_z = 0.0f;
+    float Q11_z = 0.001f;
+    float R_val_z = 0.05f;
+
+    init_single_axis(&kf->x, dt, Q00_xy, Q01_xy, Q11_xy, R_val_xy);
+    init_single_axis(&kf->y, dt, Q00_xy, Q01_xy, Q11_xy, R_val_xy);
+    init_single_axis(&kf->z, dt, Q00_z, Q01_z, Q11_z, R_val_z);
+}
+
+//-------------------------------------------------------------------
+// 单轴卡尔曼滤波更新
+//-------------------------------------------------------------------
+static float KF_Axis_Update(KF_Axis_t *axis, float imu_acc, float last_vel)
+{
+    float dt = axis->dt;
+
+    // 预测步骤
+    float v_pred    = axis->x[0] + (imu_acc - axis->x[1]) * dt;
+    float bias_pred = axis->x[1];
+
+    // 协方差预测
+    float P00 = axis->P[0][0];
+    float P01 = axis->P[0][1];
+    float P10 = axis->P[1][0];
+    float P11 = axis->P[1][1];
+
+    float P00_pred = P00 - dt*(P01 + P10) + dt*dt*P11 + axis->Q[0][0];
+    float P01_pred = P01 - dt*P11 + axis->Q[0][1];
+    float P10_pred = P10 - dt*P11 + axis->Q[1][0];
+    float P11_pred = P11 + axis->Q[1][1];
+
+    // 卡尔曼增益
+    float deno = P00_pred + axis->R;
+    if (deno < 1e-6f) deno = 1e-6f;
+
+    float K0 = P00_pred / deno;
+    float K1 = P10_pred / deno;
+
+    // 状态更新
+    float residual = last_vel - v_pred;
+    axis->x[0] = v_pred + K0 * residual;
+    axis->x[1] = bias_pred + K1 * residual;
+
+    // 协方差更新
+    axis->P[0][0] = (1 - K0) * P00_pred;
+    axis->P[0][1] = (1 - K0) * P01_pred;
+    axis->P[1][0] = P10_pred - K1 * P00_pred;
+    axis->P[1][1] = P11_pred - K1 * P01_pred;
+
+    // 协方差对称化
+    axis->P[0][1] = axis->P[1][0];
+
+    /*if(axis->x[0] > 10) axis->x[0] = last_speed;
+    last_speed = axis->x[0];*/
+
+    return axis->x[0];
+}
+
+//-------------------------------------------------------------------
+// 三轴卡尔曼滤波更新
+//-------------------------------------------------------------------
+void KF_3Axis_Update(KF_3Axis_Velocity_t *kf, float imu_acc[3], float last_vel[3], float out_vel[3])
+{
+    if (kf == NULL || imu_acc == NULL || last_vel == NULL || out_vel == NULL) {
+        out_vel[0] = 0.0f;
+        out_vel[1] = 0.0f;
+        out_vel[2] = 0.0f;
+        return;
+    }
+
+    out_vel[0] = KF_Axis_Update(&kf->x, imu_acc[0], last_vel[0]);
+    out_vel[1] = KF_Axis_Update(&kf->y, imu_acc[1], last_vel[1]);
+    out_vel[2] = KF_Axis_Update(&kf->z, imu_acc[2], last_vel[2]);
+}
+
+//惯导位置解算（数据获取中断中）
+void navigation(float DT) //X前后 Y左右，DT为s
+{
+    // 编码器解算位置
+    float v_r1 = (encoder_data_R1 * 0.1f * 2.0f * PI) / (500.0f * DT) / 15.5f;
+    float v_l1 = (encoder_data_L1 * 0.1f * 2.0f * PI) / (500.0f * DT) / 15.5f;
+    float v_r2 = (encoder_data_R2 * 0.1f * 2.0f * PI) / (500.0f * DT) / 15.5f;
+    float v_l2 = (encoder_data_L2 * 0.1f * 2.0f * PI) / (500.0f * DT) / 15.5f;
+
+    float vx_encoder = (v_r1 + v_l1 + v_r2 + v_l2) / 4.0f;
+    float vy_encoder = (v_r1 - v_l1 - v_r2 + v_l2) / 4.0f;
+
+    pos_x_encoder += vx_encoder * DT;
+    pos_y_encoder += vy_encoder * DT;
+    
+    // 2. 读取IMU加速度（预测值）
+    imu_acc[0] = icm_data.acc_x  * 9.81f;
+    imu_acc[1] = icm_data.acc_y  * 9.81f;
+    imu_acc[2] = 0.0f;
+    
+    // 3. 上一时刻融合速度作为观测参考
+    last_vel[0] = vx_encoder;
+    last_vel[1] = vy_encoder;
+    last_vel[2] = 0.0f;
+
+    // Slip detection: if encoder accel exceeds physical limit, distrust encoder
+    static float last_vx_enc = 0.0f;
+    static float last_vy_enc = 0.0f;
+    static uint8_t slip_first = 1;
+
+    float slip_accel_x = 0.0f;
+    float slip_accel_y = 0.0f;
+
+    if (!slip_first)
+    {
+        slip_accel_x = (vx_encoder - last_vx_enc) / DT;
+        slip_accel_y = (vy_encoder - last_vy_enc) / DT;
+    }
+    else
+    {
+        slip_first = 0;
+    }
+
+    last_vx_enc = vx_encoder;
+    last_vy_enc = vy_encoder;
+
+    // Save original R, boost if slipping (encoder accel > 2.5 m/s^2 -> wheel spin)
+    float saved_R_x = kf_nav.x.R;
+    float saved_R_y = kf_nav.y.R;
+
+    #define SLIP_ACCEL_THRESHOLD  (2.5f)
+    #define SLIP_R_SCALE          (200.0f)
+
+    if (fabsf(slip_accel_x) > SLIP_ACCEL_THRESHOLD)
+        kf_nav.x.R = saved_R_x * SLIP_R_SCALE;
+    if (fabsf(slip_accel_y) > SLIP_ACCEL_THRESHOLD)
+        kf_nav.y.R = saved_R_y * SLIP_R_SCALE;
+
+    
+    // 4. ===================== 卡尔曼滤波更新（仅XY有效）=====================
+    KF_3Axis_Update(&kf_nav, imu_acc, last_vel, fused_vel);
+
+    // Restore R after KF update
+    kf_nav.x.R = saved_R_x;
+    kf_nav.y.R = saved_R_y;
+
+    
+    // 5. 积分得到最终位置（真正的惯性导航结果）
+    pos_x_final += fused_vel[0] * DT;
+    pos_y_final += fused_vel[1] * DT;
+    
+    //printf("[融合速度] Vx:%.2f Vy:%.2f | [融合位置] X:%.2f Y:%.2f m\r\n",fused_vel[0], fused_vel[1], pos_x_final, pos_y_final);
+
+}
+
+
+//惯导初始化
+void navigation_init(void)
+{
+  KF_3Axis_Init(&kf_nav, 0.005f);//5ms中断
+}
